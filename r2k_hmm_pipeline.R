@@ -612,3 +612,14 @@ message(sprintf("Saved: %s, %s, %s, %s, %s",
 spearman_rho <- suppressWarnings(cor(s, y, method = "spearman", use = "complete.obs"))
 cat(sprintf("Spearman rho(score, future RV21) = %.4f\n", spearman_rho))
 
+# Export posterior probabilities P(z|t) for plotting - MINIMAL ADDITION
+rgb_plot_data <- data.frame(
+  date = test$date,
+  price = test$adjusted,
+  prob_R = prob_regime_test[, "High"],     # High vol = Red
+  prob_G = prob_regime_test[, "Low"],      # Low vol = Green
+  prob_B = prob_regime_test[, "Medium"]    # Medium vol = Blue
+)
+write.csv(rgb_plot_data, "hmm_rgb_data.csv", row.names = FALSE)
+message("Exported P(z|t) to hmm_rgb_data.csv for RGB plotting")
+
