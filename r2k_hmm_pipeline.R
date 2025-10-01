@@ -53,7 +53,7 @@ parkinson_vol_annualized <- function(high, low, n = 21, annualization = 252) {
 }
 
 rolling_beta <- function(x, y, n = 60) {
-  # returns a vector same length as x/y; NA for first n-1 entries(?)
+  # returns a vector same length as x/y; NA for first n-1 entries(?) -> Ask AJAY
   slider::slide_dbl(seq_along(x), function(i) {
     if (i < n) return(NA_real_)
     idx <- (i - n + 1):i
@@ -74,7 +74,7 @@ forward_realized_vol <- function(ret, n = 21, annualization = 252) {
 }
 
 try_viterbi <- function(fit_model, data_for_decode) {
-  # Try depmixS4::viterbi if available; otherwise return MAP from posterior()
+  # Try depmixS4::viterbi if available; otherwise return MAP from posterior() DONT CHANGE: IF AJAY NEED TO RUN
   vt <- NULL
   if ("viterbi" %in% getNamespaceExports("depmixS4")) {
     suppressWarnings({
@@ -104,7 +104,7 @@ try_viterbi <- function(fit_model, data_for_decode) {
   })
 }
 
-# Optional: light hysteresis to cut thrash (min dwell time)
+# Light hysteresis to cut thrash (minimum dwell time floor of 2)
 apply_hysteresis <- function(states, min_dwell = 3) {
   if (all(is.na(states))) return(states)
   s <- states
@@ -158,7 +158,7 @@ df <- iwm %>%
          rv21_fwd) %>%
   drop_na(abs_ret_z, log_vol_z, park_21d_z, beta_60d_z)
 
-# Train / Validate:
+# Train and Validate:
 df <- df %>% mutate(split = case_when(
   date >= TRAIN_START & date <= TRAIN_END ~ "train",
   date >= VAL_START   & date <= VAL_END   ~ "validate",
@@ -176,7 +176,7 @@ train_X <- train %>%
 all_X <- df %>%
   transmute(f1 = abs_ret_z, f2 = log_vol_z, f3 = park_21d_z, f4 = beta_60d_z)
 
-# Fit HMM 
+# Fiting the HMM (Come Back (Sunday!))
 set.seed(SEED)
 mod <- depmixS4::depmix(
   response = list(f1 ~ 1, f2 ~ 1, f3 ~ 1, f4 ~ 1),
@@ -195,10 +195,10 @@ ll <- logLik(fm)
 message(sprintf("Converged. LogLik = %.3f | AIC = %.1f | BIC = %.1f", ll, AIC(fm), BIC(fm)))
 
 # Decode on full sample 
-# Use fitted params on the full data to get a single, consistent state mapping
+# Use fitted parameters on the full data to get a single consistent mapping to states
 states_raw <- try_viterbi(fm, as.data.frame(all_X))
 
-# Optional: apply gentle hysteresis to reduce day-to-day churn
+# Optional: apply gentle hysteresis to reduce day-to-day churn or "thrash"
 states_smooth <- apply_hysteresis(states_raw, min_dwell = 2)
 
 # Attach states
@@ -215,6 +215,25 @@ state_stats <- df %>%
   mutate(regime_label = c("Low","Medium","High"))
 
 state_map <- setNames(state_stats$regime_label, state_stats$state_smooth)
+
+#$^%%$^^%$%^%$%^&^^&^^%$##@@@#$%$#$^%$#
+
+
+# 1) Save the fitted HMM so we reuse identical parameters/OOM ordering
+saveRDS(fm, "hmm_fit.rds")
+
+# 2) Save the state->regime mapping used in Script 1 (the labels your partner trains on)
+state_map_tbl <- tibble(
+  state = as.integer(names(state_map)),
+  regime = unname(state_map)
+)
+readr::write_csv(state_map_tbl, "state_map.csv")
+
+# 3) (Optional) Save your feature config for sanity checks
+saveRDS(list(PARK_N=PARK_N, BETA_N=BETA_N, ZSCORE_N_LONG=ZSCORE_N_LONG, VOL_Z_N=VOL_Z_N, ANNUALIZATION=ANNUALIZATION),
+        "feature_config.rds")
+
+#$^%$%^%$%^&^%$#$%^&^%$#@#$%^&^%$#$%^&^%$#
 
 df$regime <- state_map[as.character(df$state_smooth)] %>% factor(levels = c("Low","Medium","High"))
 
@@ -295,4 +314,301 @@ p_rv_box <- df %>%
 print(p_rv_box)
 ggsave("figs/rv21_by_regime.png", p_rv_box, width = 8, height = 5, dpi = 200)
 
+
+
+
+
+#!@#$%^&^$#@#$%^&^%$#@#$%^&^%$#@#$%^&^%$#@
+
+#Monday Night: Out-of-sampel validation test to comapre against Ajay Neural Net
+
+
+
+
+# r2k_hmm_oos_eval_continuous.R
+suppressPackageStartupMessages({
+  pkgs <- c("tidyverse","lubridate","tidyquant","zoo","slider",
+            "PerformanceAnalytics","depmixS4","ggplot2","readr")
+  to_install <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+  if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+  lapply(pkgs, library, character.only = TRUE)
+})
+
+# Parameters
+SYMBOL        <- "IWM"
+MARKET        <- "SPY"
+START_DATE    <- as.Date("2014-01-01")
+ANNUALIZATION <- 252
+
+NSTATES       <- 3
+SEED          <- 42
+MAXIT         <- 1000
+OOS_FRAC      <- 0.15           # last 15% as OOS
+STICKY_DWELL  <- 2              # keep same as Script 1 for identical behavior
+USE_SAVED_ARTIFACTS <- TRUE     # expects hmm_fit.rds + state_map.csv from Script 1
+
+# Outputs
+OUT_TIMESERIES_CSV <- "r2k_hmm_timeseries.csv"
+OUT_PRED_CSV       <- "r2k_hmm_oos_predictions_continuous.csv"
+OUT_LIFT_CSV       <- "r2k_hmm_oos_lift_deciles.csv"
+OUT_CALIB_CSV      <- "r2k_hmm_oos_calibration_pHigh.csv"
+OUT_METRICS_TXT    <- "r2k_hmm_oos_metrics_continuous.txt"
+
+set.seed(SEED)
+
+# -------------------- Helpers --------------------
+roll_mean_lag <- function(x, n) lag(slider::slide_dbl(x, mean, .before = n-1, .complete = TRUE), 1)
+roll_sd_lag   <- function(x, n) lag(slider::slide_dbl(x, sd,   .before = n-1, .complete = TRUE), 1)
+roll_zscore   <- function(x, n) { mu <- roll_mean_lag(x, n); sdv <- roll_sd_lag(x, n); (x - mu)/sdv }
+
+parkinson_vol_annualized <- function(high, low, n = 21, annualization = 252) {
+  hl <- log(high/low)^2
+  coef <- 1/(4 * n * log(2))
+  slider::slide_dbl(hl, ~ sqrt(coef * sum(.x)) * sqrt(annualization),
+                    .before = n-1, .complete = TRUE)
+}
+
+rolling_beta <- function(x, y, n = 60) {
+  slider::slide_dbl(seq_along(x), function(i) {
+    if (i < n) return(NA_real_)
+    idx <- (i - n + 1):i
+    cx <- x[idx]; cy <- y[idx]
+    if (all(is.na(cx)) || all(is.na(cy))) return(NA_real_)
+    v <- var(cy, na.rm = TRUE); if (is.na(v) || v == 0) return(NA_real_)
+    cov(cx, cy, use = "complete.obs") / v
+  })
+}
+
+forward_realized_vol <- function(ret, n = 21, annualization = 252) {
+  slider::slide_dbl(ret, ~ sd(.x, na.rm = TRUE) * sqrt(annualization),
+                    .after = n, .before = 0, .complete = TRUE) %>%
+    dplyr::lead(1)
+}
+
+get_state_prob_matrix <- function(post_obj, nstates) {
+  df <- as.data.frame(post_obj); cn <- colnames(df)
+  scols <- grep("^S[0-9]+$", cn, value = TRUE)
+  if (length(scols) == nstates) return(as.matrix(df[, scols, drop = FALSE]))
+  scols2 <- grep("^S[0-9]+", cn, value = TRUE)
+  if (length(scols2) >= 1) {
+    mat <- as.matrix(df[, scols2, drop = FALSE])
+    if (ncol(mat) >= nstates) mat <- mat[, seq_len(nstates), drop = FALSE]
+    colnames(mat) <- paste0("S", seq_len(nstates))
+    return(mat)
+  }
+  numcols <- which(vapply(df, is.numeric, TRUE))
+  if (length(numcols) >= nstates) {
+    mat <- as.matrix(df[, numcols[seq_len(nstates)], drop = FALSE])
+    colnames(mat) <- paste0("S", seq_len(nstates))
+    return(mat)
+  }
+  stop("Could not locate state probability columns in posterior() output.")
+}
+
+enforce_min_dwell <- function(states, min_dwell = 2) {
+  if (length(states) == 0) return(states)
+  r <- rle(states)
+  r$lengths[r$lengths < min_dwell] <- min_dwell
+  out <- inverse.rle(r)
+  out[seq_along(states)]
+}
+
+try_posterior <- function(fit_model, newdata) {
+  mod_new <- depmixS4::depmix(
+    response = list(f1 ~ 1, f2 ~ 1, f3 ~ 1, f4 ~ 1),
+    data     = newdata,
+    nstates  = fit_model@nstates,
+    family   = list(gaussian(), gaussian(), gaussian(), gaussian())
+  )
+  mod_new <- depmixS4::setpars(mod_new, depmixS4::getpars(fit_model))
+  depmixS4::posterior(mod_new, type = "smoothing")
+}
+
+try_viterbi <- function(fit_model, newdata) {
+  vt <- NULL
+  if ("viterbi" %in% getNamespaceExports("depmixS4")) {
+    suppressWarnings({
+      mod_new <- depmixS4::depmix(
+        response = list(f1 ~ 1, f2 ~ 1, f3 ~ 1, f4 ~ 1),
+        data     = newdata,
+        nstates  = fit_model@nstates,
+        family   = list(gaussian(), gaussian(), gaussian(), gaussian())
+      )
+      mod_new  <- depmixS4::setpars(mod_new, depmixS4::getpars(fit_model))
+      vt       <- depmixS4::viterbi(mod_new)
+    })
+  }
+  if (!is.null(vt)) return(vt$state)
+  post <- try_posterior(fit_model, newdata)
+  pmax.col(get_state_prob_matrix(post, fit_model@nstates))
+}
+
+# Data & Features (identical to Script 1 above figure draw)
+message("Downloading data…")
+px_iwm <- tidyquant::tq_get(SYMBOL, get = "stock.prices", from = START_DATE)
+px_spy <- tidyquant::tq_get(MARKET, get = "stock.prices", from = START_DATE)
+stopifnot(nrow(px_iwm) > 0, nrow(px_spy) > 0)
+
+iwm <- px_iwm %>%
+  arrange(date) %>%
+  mutate(ret = c(NA, diff(log(adjusted))),
+         abs_ret = abs(ret),
+         log_vol = log(volume))
+
+spy <- px_spy %>%
+  arrange(date) %>%
+  transmute(date, mret = c(NA, diff(log(adjusted))))
+
+df <- iwm %>%
+  left_join(spy, by = "date") %>%
+  mutate(
+    park_21d   = parkinson_vol_annualized(high, low, n = 21, annualization = ANNUALIZATION),
+    beta_60d   = rolling_beta(ret, mret, n = 60),
+    abs_ret_z  = roll_zscore(abs_ret, 252),
+    log_vol_z  = roll_zscore(log_vol, 21),
+    park_21d_z = roll_zscore(park_21d, 252),
+    beta_60d_z = roll_zscore(beta_60d, 252),
+    rv21_fwd   = forward_realized_vol(ret, n = 21, annualization = ANNUALIZATION)
+  ) %>%
+  dplyr::select(date, adjusted, ret, abs_ret, log_vol,
+                park_21d, beta_60d,
+                abs_ret_z, log_vol_z, park_21d_z, beta_60d_z, rv21_fwd) %>%
+  tidyr::drop_na(abs_ret_z, log_vol_z, park_21d_z, beta_60d_z)
+
+# Chronological split
+N <- nrow(df); split_idx <- floor((1 - OOS_FRAC) * N)
+train <- df[1:split_idx, , drop = FALSE]
+test  <- df[(split_idx + 1):N, , drop = FALSE]
+
+train_X <- train %>% transmute(f1 = abs_ret_z, f2 = log_vol_z, f3 = park_21d_z, f4 = beta_60d_z)
+test_X  <- test  %>% transmute(f1 = abs_ret_z, f2 = log_vol_z, f3 = park_21d_z, f4 = beta_60d_z)
+
+#  Load saved fit/mapping OR fit on train 
+if (USE_SAVED_ARTIFACTS && file.exists("hmm_fit.rds") && file.exists("state_map.csv")) {
+  message("Loading saved HMM artifacts from Script 1…")
+  fm <- readRDS("hmm_fit.rds")
+  state_map_tbl <- readr::read_csv("state_map.csv", show_col_types = FALSE)
+  state_map <- setNames(state_map_tbl$regime, as.character(state_map_tbl$state))
+} else {
+  message("Artifacts not found or disabled. Fitting on train (85%) and mapping states by train mean forward RV)…")
+  set.seed(SEED)
+  mod <- depmixS4::depmix(
+    response = list(f1 ~ 1, f2 ~ 1, f3 ~ 1, f4 ~ 1),
+    data     = as.data.frame(train_X),
+    nstates  = NSTATES,
+    family   = list(gaussian(), gaussian(), gaussian(), gaussian())
+  )
+  fm <- depmixS4::fit(mod, emcontrol = depmixS4::em.control(maxit = MAXIT), verbose = FALSE)
+  post_train <- depmixS4::posterior(fm, type = "smoothing")
+  W <- get_state_prob_matrix(post_train, NSTATES)
+  rv_idx <- which(!is.na(train$rv21_fwd))
+  state_means <- as.numeric(colSums(W[rv_idx,,drop=FALSE] * train$rv21_fwd[rv_idx]) / colSums(W[rv_idx,,drop=FALSE]))
+  ord_states <- order(state_means)                                        # ascending mean RV
+  state_map <- setNames(c("Low","Medium","High"), as.character(ord_states))
+}
+
+# Decode TEST with frozen parameters
+post_test <- try_posterior(fm, as.data.frame(test_X))
+prob_state_test <- get_state_prob_matrix(post_test, NSTATES)
+
+# Map state probabilites -> regime probabilites using state_map order
+ord <- as.integer(names(sort(setNames(1:3, names(state_map))[names(state_map)]))) # indices in Low/Med/High order
+# Build permutation to L/M/H
+perm <- match(c("Low","Medium","High"), state_map[as.character(1:NSTATES)])
+prob_regime_test <- prob_state_test[, perm, drop = FALSE]
+colnames(prob_regime_test) <- c("Low","Medium","High")
+
+# Hard states & smoothing identical to Script 1
+states_test <- try_viterbi(fm, as.data.frame(test_X))
+states_test_smooth <- enforce_min_dwell(states_test, STICKY_DWELL)
+regime_test <- factor(state_map[as.character(states_test_smooth)],
+                      levels = c("Low","Medium","High"))
+
+# Continuous risk score: E[regime index]
+score <- prob_regime_test %*% matrix(c(1,2,3), ncol = 1)
+score <- as.numeric(score)
+
+#  Continuous metrics on last 15% 
+ok <- which(!is.na(test$rv21_fwd))
+y  <- test$rv21_fwd[ok]
+s  <- score[ok]
+pH <- prob_regime_test[ok, "High"]
+
+rho <- suppressWarnings(cor(s, y, method = "spearman"))
+tau <- suppressWarnings(cor(s, y, method = "kendall"))
+r2  <- summary(lm(y ~ s))$r.squared
+
+# Lift by score deciles
+lift_tbl <- tibble(score = s, rv = y) %>%
+  mutate(decile = ntile(score, 10)) %>%
+  group_by(decile) %>%
+  summarise(n = n(),
+            mean_score = mean(score),
+            mean_rv = mean(rv),
+            median_rv = median(rv),
+            .groups = "drop") %>%
+  arrange(decile)
+
+# Top-q capture (no binning of target)
+q <- 0.10
+thr <- quantile(s, probs = 1 - q, na.rm = TRUE)
+is_top <- s >= thr
+mean_top  <- mean(y[is_top])
+mean_rest <- mean(y[!is_top])
+uplift    <- mean_top - mean_rest
+wt <- suppressWarnings(wilcox.test(y[is_top], y[!is_top], alternative = "greater"))
+
+# Calibration by P(High) deciles
+calib_tbl <- tibble(pHigh = as.numeric(pH), rv = y) %>%
+  mutate(bin = ntile(pHigh, 10)) %>%
+  group_by(bin) %>%
+  summarise(n = n(), mean_pHigh = mean(pHigh), mean_rv = mean(rv),
+            median_rv = median(rv), .groups = "drop") %>%
+  arrange(bin)
+
+q_hi <- 0.20
+hi_cut <- quantile(train$rv21_fwd, 1 - q_hi, na.rm = TRUE)   # train-only threshold
+y_true_bin <- as.integer(test$rv21_fwd[ok] >= hi_cut)        # 1 = High, 0 = Rest
+p_high <- as.numeric(prob_regime_test[ok, "High"])
+
+
+cat("==== OOS metrics on last 15% ====\n")
+cat(sprintf("Spearman rho(score, future RV21): %.4f\n", rho))
+cat(sprintf("ROC-AUC (High vs Rest, top %.0f%% by train RV): %.4f\n", 100*q_hi, as.numeric(auc_val)))
+
+# Save
+df$set <- c(rep("train", nrow(train)), rep("test", nrow(test)))
+readr::write_csv(df, OUT_TIMESERIES_CSV)
+
+oos_out <- tibble(
+  date   = test$date,
+  regime = regime_test,
+  state  = as.integer(states_test_smooth),
+  score  = score
+) %>%
+  bind_cols(as_tibble(prob_regime_test)) %>%
+  rename(prob_Low = Low, prob_Medium = Medium, prob_High = High)
+
+readr::write_csv(oos_out, OUT_PRED_CSV)
+readr::write_csv(lift_tbl, OUT_LIFT_CSV)
+readr::write_csv(calib_tbl, OUT_CALIB_CSV)
+
+metrics_txt <- sprintf(paste(
+  "Continuous OOS metrics on last %.0f%% (no tertiles)\n",
+  "Spearman rho(score, RV21_fwd) = %.4f\n",
+  "Kendall tau(score, RV21_fwd)  = %.4f\n",
+  "Linear R^2 (RV21_fwd ~ score) = %.4f\n",
+  "Top %.0f%% score capture: mean_top=%.6f | mean_rest=%.6f | uplift=%.6f | Wilcoxon p=%.3g\n",
+  sep = ""),
+  100*OOS_FRAC, rho, tau, r2, 100*q, mean_top, mean_rest, uplift, wt$p.value
+)
+writeLines(metrics_txt, OUT_METRICS_TXT)
+
+message(sprintf("Saved: %s, %s, %s, %s, %s",
+                OUT_TIMESERIES_CSV, OUT_PRED_CSV, OUT_LIFT_CSV, OUT_CALIB_CSV, OUT_METRICS_TXT))
+
+#Spit Out Spearman Figure ISOLATED
+# Spearman rho between score and forward realized vol
+spearman_rho <- suppressWarnings(cor(s, y, method = "spearman", use = "complete.obs"))
+cat(sprintf("Spearman rho(score, future RV21) = %.4f\n", spearman_rho))
 
